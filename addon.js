@@ -39,7 +39,7 @@ const manifest = {
     id: "com.aryplus.stremio",
 
     // bumped so Stremio notices the update
-    version: "0.1.1",
+    version: "0.1.2",
 
     name: "ARY+",
 
@@ -152,6 +152,85 @@ function normalizeGenres(genres) {
             return genre?.title;
         })
         .filter(Boolean);
+}
+
+
+// =========================================================
+// HLS proxy helpers
+// =========================================================
+
+function encodeUrl(url) {
+    return Buffer
+        .from(url)
+        .toString("base64url");
+}
+
+
+function decodeUrl(value) {
+    return Buffer
+        .from(value, "base64url")
+        .toString("utf8");
+}
+
+
+function makeHlsProxyUrl(remoteUrl) {
+    return (
+        `${PUBLIC_BASE_URL}/hls/` +
+        encodeUrl(remoteUrl)
+    );
+}
+
+
+function absoluteHlsUrl(value, baseUrl) {
+    return new URL(
+        value,
+        baseUrl
+    ).toString();
+}
+
+
+function rewriteM3u8(text, playlistUrl) {
+    return text
+        .split("\n")
+        .map(line => {
+            const trimmed =
+                line.trim();
+
+            if (!trimmed) {
+                return line;
+            }
+
+            // Segment URI or nested playlist URI.
+            if (!trimmed.startsWith("#")) {
+                const absolute =
+                    absoluteHlsUrl(
+                        trimmed,
+                        playlistUrl
+                    );
+
+                return makeHlsProxyUrl(
+                    absolute
+                );
+            }
+
+            // Rewrite URI="..." attributes used by HLS tags
+            // such as EXT-X-KEY, EXT-X-MAP and EXT-X-MEDIA.
+            return line.replace(
+                /URI="([^"]+)"/g,
+                (_, uri) => {
+                    const absolute =
+                        absoluteHlsUrl(
+                            uri,
+                            playlistUrl
+                        );
+
+                    return (
+                        `URI="${makeHlsProxyUrl(absolute)}"`
+                    );
+                }
+            );
+        })
+        .join("\n");
 }
 
 
@@ -641,7 +720,11 @@ builder.defineStreamHandler(
             }
 
             console.log(
-                `[stream] returning: ${episode.videoSource}`
+                `[stream] source: ${episode.videoSource}`
+            );
+
+            console.log(
+                `[stream] proxied: ${makeHlsProxyUrl(episode.videoSource)}`
             );
 
             /*
@@ -660,7 +743,9 @@ builder.defineStreamHandler(
                             episode.title,
 
                         url:
-                            episode.videoSource,
+                            makeHlsProxyUrl(
+                                episode.videoSource
+                            ),
 
                         behaviorHints: {
                             notWebReady: true
@@ -689,6 +774,213 @@ builder.defineStreamHandler(
 
 const app =
     express();
+
+
+// =========================================================
+// HLS proxy
+// =========================================================
+
+app.get(
+    "/hls/:encoded",
+
+    async (req, res) => {
+        try {
+            const remoteUrl =
+                decodeUrl(
+                    req.params.encoded
+                );
+
+            const parsed =
+                new URL(remoteUrl);
+
+            /*
+             * Only proxy ARY's VOD CDN.
+             * This prevents the endpoint becoming
+             * a generic open proxy.
+             */
+            if (
+                parsed.protocol !== "https:" ||
+                !(
+                    parsed.hostname === "aryzap.com" ||
+                    parsed.hostname.endsWith(".aryzap.com")
+                )
+            ) {
+                return res
+                    .status(403)
+                    .send(
+                        "Invalid HLS host"
+                    );
+            }
+
+            console.log(
+                `[hls] ${remoteUrl}`
+            );
+
+            const headers = {
+                "User-Agent":
+                    "Mozilla/5.0",
+
+                Accept:
+                    "*/*",
+
+                Referer:
+                    "https://aryplus.tv/"
+            };
+
+            // Preserve byte-range requests from Stremio.
+            if (req.headers.range) {
+                headers.Range =
+                    req.headers.range;
+            }
+
+            const upstream =
+                await fetch(
+                    remoteUrl,
+                    {
+                        headers,
+                        redirect: "follow"
+                    }
+                );
+
+            if (!upstream.ok) {
+                console.error(
+                    `[hls] upstream ${upstream.status}: ${remoteUrl}`
+                );
+
+                return res
+                    .status(
+                        upstream.status
+                    )
+                    .send(
+                        "ARY stream request failed"
+                    );
+            }
+
+            const contentType =
+                upstream.headers.get(
+                    "content-type"
+                ) || "";
+
+            const pathname =
+                parsed.pathname
+                    .toLowerCase();
+
+            const isPlaylist =
+                pathname.endsWith(
+                    ".m3u8"
+                ) ||
+                contentType
+                    .toLowerCase()
+                    .includes(
+                        "mpegurl"
+                    );
+
+            // -----------------------------------------
+            // Playlist
+            // -----------------------------------------
+
+            if (isPlaylist) {
+                const playlist =
+                    await upstream.text();
+
+                const rewritten =
+                    rewriteM3u8(
+                        playlist,
+                        remoteUrl
+                    );
+
+                res.status(200);
+
+                res.set(
+                    "Content-Type",
+                    "application/vnd.apple.mpegurl"
+                );
+
+                res.set(
+                    "Cache-Control",
+                    "no-cache"
+                );
+
+                res.set(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                );
+
+                res.set(
+                    "Cross-Origin-Resource-Policy",
+                    "cross-origin"
+                );
+
+                return res.send(
+                    rewritten
+                );
+            }
+
+
+            // -----------------------------------------
+            // Segment / key / media resource
+            // -----------------------------------------
+
+            res.status(
+                upstream.status
+            );
+
+            const passHeaders = [
+                "content-type",
+                "content-length",
+                "content-range",
+                "accept-ranges",
+                "cache-control"
+            ];
+
+            for (const name of passHeaders) {
+                const value =
+                    upstream.headers.get(
+                        name
+                    );
+
+                if (value) {
+                    res.set(
+                        name,
+                        value
+                    );
+                }
+            }
+
+            res.set(
+                "Access-Control-Allow-Origin",
+                "*"
+            );
+
+            res.set(
+                "Cross-Origin-Resource-Policy",
+                "cross-origin"
+            );
+
+            const data =
+                Buffer.from(
+                    await upstream
+                        .arrayBuffer()
+                );
+
+            return res.send(
+                data
+            );
+
+        } catch (error) {
+            console.error(
+                "[hls] proxy error:",
+                error
+            );
+
+            return res
+                .status(502)
+                .send(
+                    "HLS proxy error"
+                );
+        }
+    }
+);
 
 
 // =========================================================
