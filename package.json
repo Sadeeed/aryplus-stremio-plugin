@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node addon.js",
-    "remux": "node addon_remux.js"
+    "start": "node addon_remux.js",
+    "startold": "node addon.js"
   },
   "keywords": [],
   "author": "",
