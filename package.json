@@ -2,7 +2,7 @@
   "name": "aryplus-stremio",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "addon_remux.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node addon_remux.js",
